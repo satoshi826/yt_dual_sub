@@ -1,0 +1,36 @@
+# ===== Android =====
+android/.gradle/
+android/.idea/
+android/build/
+android/app/build/
+android/captures/
+android/local.properties
+android/*.iml
+android/app/*.iml
+android/.cxx/
+
+# Gradle wrapper jar(各自で生成、リポジトリにコミットしない方針)
+# 必要であれば後で `gradle wrapper` で生成 → コミット
+android/gradle/wrapper/gradle-wrapper.jar
+android/gradlew
+android/gradlew.bat
+
+# キー・サインイン関連(個人用途のため鍵をリポジトリに置かない)
+android/**/*.keystore
+android/**/*.jks
+android/keystore.properties
+
+# ===== macOS =====
+.DS_Store
+
+# ===== Editor =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ===== Build artifacts =====
+node_modules/
+dist/
+*.log
