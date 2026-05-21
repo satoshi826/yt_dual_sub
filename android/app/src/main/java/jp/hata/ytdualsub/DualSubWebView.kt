@@ -37,6 +37,10 @@ private fun createConfiguredWebView(
     context: android.content.Context,
     injectionScript: String,
 ): WebView {
+    // Chrome DevTools (chrome://inspect) から WebView 中身を覗けるようにする
+    // (リリースビルドでも有効。個人用途のため。気になれば BuildConfig.DEBUG で絞れる)
+    WebView.setWebContentsDebuggingEnabled(true)
+
     val webView = WebView(context)
 
     with(webView.settings) {
