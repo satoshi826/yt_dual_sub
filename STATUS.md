@@ -1,6 +1,6 @@
 # yt_dual_sub — プロジェクトステータス
 
-最終更新: 2026-05-23(WebView 検知回避 + sticky-player 抑制)
+最終更新: 2026-05-23(www.youtube.com への切替で WebView 回避策を全廃)
 
 このドキュメントは中断と再開のためのハンドオーバーです。
 コードは進化していくので、不一致を感じたら `git log` と現物コードを優先してください。
@@ -41,9 +41,8 @@ YouTube の動画上に **二か国語字幕**(原文 + 翻訳)を同時表示�
 | **Top / Bottom は完全対等な 2 lane** | UI 上の区別は配置と色だけ。データ構造も lanes.{top,bottom} で並列。どちらの lane も独立に言語を指定可能 |
 | **lane ごとに「ネイティブ > 翻訳 fallback」** | 同言語の手動字幕があれば直接取得(`tlang` 不要)、無ければ asr、それも無ければ別字幕 + `tlang` で翻訳。動画に両言語の手動字幕があれば両方ともネイティブ |
 | **video.currentTime ベースで描画** | 全 cue を事前取得済みなので DOM 監視・per-segment 翻訳・YT 字幕同期は不要 |
-| **WebView + JS 注入** | ReVanced 流の Smali 改造は難度高すぎ。`m.youtube.com` を WebView で表示し JS で augment |
-| **WebView 検知回避(Android 側)** | YT は WebView を検知すると sticky ミニプレーヤーモードに固定する。Chrome モバイル完全 UA(`; wv`/`Version/4.0` 除去)+ `navigator.userAgentData` + `window.chrome` 偽装で「本物の Chrome モバイル」として見せかける |
-| **sticky-player 抑制(対症療法)** | 上記偽装でも YT は他の手段で WebView を見抜くため、`documentElement` 直下に `!important` CSS を注入して常時 `position: relative` + `aspect-ratio: 16/9` に強制。`<head>` は YT が定期的に再描画して我々の `<style>` を剥がすため `documentElement` 直下を選択 + MutationObserver で自己修復 |
+| **WebView + JS 注入** | ReVanced 流の Smali 改造は難度高すぎ。WebView で `www.youtube.com` を表示し JS で augment |
+| **`www.youtube.com` (desktop) を使う** | `m.youtube.com` (mobile) は WebView だと sticky-player クラスが強制発動してプレーヤーが 125px に固定される。UA 偽装などでは回避不能だったが、デスクトップ版にはそもそも sticky-player の概念が無いので問題ごと消える。UA は WebView デフォルトのまま、`window.chrome` 等の偽装も不要 |
 | **JS を symlink で単一ソース** | ブラウザ Console 貼付と Android 注入で同じコードを共有 |
 | **Trusted Types 対応**(innerHTML 不使用) | YouTube の CSP が `require-trusted-types-for 'script'` を課しているため |
 | **YT 純正字幕は常に非表示** | プレーヤーがマウントされている間 `body.dualsub-active` を付与して visibility:hidden。表示はすべて自前 overlay |
@@ -189,15 +188,12 @@ PoC スクリプトを WebView に注入するシェル。
 - `FLAG_KEEP_SCREEN_ON` で動画再生中の画面オフ防止
 - `OnBackPressedCallback` で WebView 履歴を戻る
 
-**DualSubWebView.kt**
-- `m.youtube.com` を WebView で表示
-- **Chrome モバイル完全 UA**(Pixel 8 / Chrome 130)を強制。WebView デフォルトの `; wv` や `Version/4.0` を含まない
-- **`BROWSER_SPOOF`**: `onPageStarted` で `navigator.userAgentData.brands` と `window.chrome` を Chrome 風オブジェクトで上書き
-- **`UNSTICK_PLAYER`**: `onPageStarted` + `onPageFinished` で `documentElement` 直下に `<style>` を注入し sticky ミニプレーヤーを抑制。watch ページのみ `data-dualsub-unstick="on"` を立てて CSS を有効化、SPA 遷移(yt-navigate-finish, popstate, pushState patch)に追従。MutationObserver で <style> 剥がし攻撃に自己修復
+**DualSubWebView.kt** (120 行、極めて素直)
+- `www.youtube.com` (desktop 版) を WebView で表示。UA は WebView デフォルトのまま
 - JS / DOM storage / Cookie 有効化、`loadWithOverviewMode = false` / `useWideViewPort = true`
 - `WebView.setWebContentsDebuggingEnabled(true)` で `chrome://inspect` から覗ける
 - `onPageFinished` で assets/dualsub_overlay.js を `evaluateJavascript` 注入
-- **ビルドハッシュロギング**: Kotlin 内 `UNSTICK_PLAYER`/`BROWSER_SPOOF` と assets/dualsub_overlay.js の内容ハッシュ(8桁 hex)を毎ページ Logcat と JS console に出力。リビルド反映確認用
+- assets/dualsub_overlay.js の内容ハッシュ(8桁 hex)を毎ページ Logcat と JS console に出力(リビルド反映確認用)
 - `WebChromeClient.onConsoleMessage` で `console.log` を Logcat (`DualSubJS` tag) に転送
 
 ### 開発手順
@@ -207,7 +203,7 @@ PoC スクリプトを WebView に注入するシェル。
 4. ▶ Run でエミュレータ(Pixel 3a API 34)に実行
 
 ### 動作確認
-1. アプリ起動 → m.youtube.com ホーム
+1. アプリ起動 → www.youtube.com ホーム
 2. 動画タップ → DualSub バー出現
 3. バーをタップして設定パネル展開
 4. Logcat `DualSubJS` で JS のログ確認
@@ -267,17 +263,13 @@ PoC スクリプトを WebView に注入するシェル。
   - 同一 URL は fetch dedupe
   - 言語の `auto` 概念は廃止、両 lane とも明示指定
 
-### Phase 4: WebView 検知回避 + sticky-player 抑制(現在ここ)
+### Phase 4: sticky-player 問題の調査と本質的な解決(現在ここ)
 - WebView で動画ページを開くと YT が即座にミニプレーヤー (`#player-container-id.sticky-player` / `position: fixed; height: 125px`) に固定する症状を確認
-- 検知回避を段階的に追加: Chrome モバイル完全 UA → `navigator.userAgentData` 偽装 → `window.chrome` 偽装。いずれも単独では sticky 化を防げず
-- 対症療法として `documentElement` 直下に `!important` CSS を注入して `position: relative` + `aspect-ratio: 16/9` を強制
-- 試行錯誤の知見:
-  - `<head>` に <style> を append すると YT が定期的に剥がす → `documentElement` 直下に変更
-  - `onPageStarted` 時点で `documentElement` が null のことがあり、ガードを先に立てると onPageFinished の再注入が抑止される → null チェックでスキップする実装に
-  - `padding-bottom` で aspect-ratio を取る古典手法と `.player-placeholder` がレイアウトに余白を作る → `padding: 0` + `display: none` で潰す
-  - sticky-player クラス除去は YT に即座に付け直されるためレースに勝てず断念、CSS specificity 勝負に集中
-- 適用範囲を watch ページに限定(`html[data-dualsub-unstick="on"]` スコープ、SPA 遷移追従)
-- ビルドハッシュロギングを導入し、コード反映確認を console.log で一目化
+- **試行錯誤 (遠回り)**: WebView 検知が原因と仮定して以下を順に試行 — Chrome モバイル完全 UA → `navigator.userAgentData` 偽装 → `window.chrome` 偽装。いずれも単独では sticky 化を防げず、対症療法として `documentElement` 直下に `!important` CSS を注入する MutationObserver 自己修復付きの仕組みを構築
+- **本質特定**: 実機 Android Chrome で `m.youtube.com` を開くと普通に表示されることから WebView 特有問題と確信。さらに切り分けると **URL を `www.youtube.com` に変えるだけ**で UA は WebView デフォルトのまま問題が消えることが判明
+- **真因**: `sticky-player` クラスは m.youtube.com に固有の「スクロール時 mini-player」機能。WebView 上では何らかの内部シグナルでロード直後から発動していた。一方 www.youtube.com には sticky-player クラスが存在しないため、デスクトップ版に切り替えるだけで問題は消滅する
+- **クリーンアップ**: 試行錯誤で積んだ UA 偽装(CHROME_MOBILE_UA)、`BROWSER_SPOOF`、`UNSTICK_PLAYER` を全廃。DualSubWebView.kt は 365 → 120 行(67% 減)に
+- **教訓**: 「現象が WebView で再現するから WebView が原因」とは限らない。サイト側の差(m. vs www.)が真因のこともある。怪しい仮説の検証で時間を使う前に、別 URL や別ブラウザでの比較を先にやるべきだった
 
 ---
 
@@ -312,9 +304,7 @@ PoC スクリプトを WebView に注入するシェル。
 | **YT TOS** | 改造アプリのストア配布は禁止。**個人/学習用途のみ** |
 | **InnerTube API の安定性** | Google が clientVersion を弾く可能性あり。fallback は無し(現状) |
 | **AGP/AS バージョン** | AS Hedgehog (2023.x) は AGP 8.1.2 まで。新版 AS が必要 |
-| **YT が <head> 内の <style> を剥がす** | `documentElement` 直下に append + MutationObserver で自己修復 |
-| **WebView 検知** | UA + Client Hints + window.chrome 全部揃えても YT は別経路で見抜く。sticky 化は CSS で対症療法 |
-| **`#player-container-id` の `padding-bottom`** | YT 古典の aspect-ratio 確保技法。`padding: 0 !important` で殺さないと内側がオーバーフローする |
+| **`m.youtube.com` の sticky-player 暴発** | WebView で m.youtube.com を開くとプレーヤーが 125px に固定される(UA 偽装などでは回避不能)。**`www.youtube.com` を使えば回避可能**(sticky-player クラスがそもそも無い) |
 
 ---
 
@@ -350,8 +340,8 @@ PoC スクリプトを WebView に注入するシェル。
 ### YouTube
 | 項目 | 値 |
 |------|-----|
-| モバイル URL | `https://m.youtube.com/` |
-| プレーヤー | `#movie_player`、なければ `<video>` の position 付き祖先 |
+| 使用 URL | `https://www.youtube.com/` (desktop 版。m.youtube.com は sticky-player 問題で不採用) |
+| プレーヤー | `#movie_player`(`.html5-video-player` でも可) |
 
 ### InnerTube API (字幕取得)
 ```
