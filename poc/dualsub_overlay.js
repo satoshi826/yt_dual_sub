@@ -1,16 +1,17 @@
 // DualSub — YouTube 二か国語字幕オーバーレイ
 //
 // Pastes into any youtube.com page (Console) or runs as injected JS in an
-// Android WebView. Reads YouTube's rendered captions, translates them with
-// the gtx Google Translate endpoint, and draws both lines as our own overlay.
+// Android WebView. Fetches the video's caption tracks via the InnerTube
+// player endpoint (ANDROID client context, which bypasses PoToken), then
+// fetches the original-language XML and the auto-translated XML and renders
+// both lines as our own overlay synchronized to video.currentTime.
 //
 // Design constraints (discovered the hard way):
-//   - Direct fetch of captionTracks[].baseUrl is rejected by PoToken; the
-//     only reliable caption source is the DOM (.ytp-caption-segment).
+//   - Direct fetch of captionTracks[].baseUrl from ytInitialPlayerResponse
+//     returns 0 bytes (PoToken blocks unauthenticated browser context).
+//     InnerTube /youtubei/v1/player with ANDROID client returns baseUrls
+//     that ARE fetchable. That is our caption source.
 //   - YouTube enforces Trusted Types CSP, so we never use innerHTML.
-//   - Mobile YouTube doesn't expose a stable CC button DOM, so we observe
-//     captions instead of trying to mirror button state. To enable captions
-//     we attempt button click; if that fails we dispatch the 'c' shortcut.
 //   - WebView calc(100vh - X) sometimes evaluates to 0, so panel sizing is
 //     set imperatively from JS using window.innerHeight.
 //
@@ -20,10 +21,8 @@
 //   - Stop with __dualsubStop().
 
 (() => {
-  'use strict';
-
   if (window.__dualsubInstalled) {
-    console.log('[dualsub] already installed. Call __dualsubStop() first.');
+    console.log('[dualsub] already installed. Call __dualsubStop() to remove.');
     return;
   }
   window.__dualsubInstalled = true;
@@ -32,17 +31,27 @@
   // Constants
   // ──────────────────────────────────────────────────────────────
   const STORAGE_KEY = 'dualsub-config-v1';
-  const POLL_MS = 200;
-  const MAX_CACHE = 500;
+  const POLL_MS = 250;
+  const INNERTUBE_URL = 'https://www.youtube.com/youtubei/v1/player?prettyPrint=false';
+  const INNERTUBE_CONTEXT = {
+    client: {
+      clientName: 'ANDROID',
+      clientVersion: '20.10.38',
+      androidSdkVersion: 34,
+    },
+  };
 
   const DEFAULT_CONFIG = {
     enabled: true,
-    // Top line — what YouTube renders (original).
-    topLang: 'auto',
+    // Top / Bottom は完全対等。各 lane の言語は独立に明示指定する。
+    // それぞれ:
+    //   - 同言語の手動字幕があればそれ(ネイティブ)
+    //   - 無ければ asr 字幕
+    //   - それも無ければ別字幕 + tlang による自動翻訳
+    topLang: 'en',
     topColor: '#ffffff',
     topFontSize: 3.5,        // % of player height
-    // Bottom line — our translation.
-    bottomLang: 'en',
+    bottomLang: 'ja',
     bottomColor: '#4fc3f7',
     bottomFontSize: 3.0,
     // Shared.
@@ -71,13 +80,6 @@
 
   const SEL = {
     player: '#movie_player, .html5-video-player',
-    captionTexts: ['.ytp-caption-segment', '.caption-visual-line', '[class*="caption-segment"]'],
-    ccButton: [
-      '.ytp-subtitles-button[aria-pressed]',
-      'button[aria-pressed][aria-label*="字幕"]',
-      'button[aria-pressed][aria-label*="subtitle" i]',
-      'button[aria-pressed][aria-label*="caption" i]',
-    ].join(', '),
   };
 
   // ──────────────────────────────────────────────────────────────
@@ -85,22 +87,12 @@
   // ──────────────────────────────────────────────────────────────
   let player = null;
   let playerResizeObs = null;
-  let lastText = '';
   let lastUrl = location.href;
-  let updateSeq = 0;
-  // YouTube 側の字幕状態(複数シグナルから観察)。
-  // attemptYtSync が ON/OFF どちらの方向にも揃えに行く前提で、観察結果は
-  // 都度上書き(非 sticky)。新しい同期操作が走ったら古い操作は seq で破棄。
-  let ytCaptionsOn = false;
-  let syncSeq = 0;
   const cleanups = [];
-  const sleep = ms => new Promise(r => setTimeout(r, ms));
 
   // ──────────────────────────────────────────────────────────────
   // Config
   // ──────────────────────────────────────────────────────────────
-  // Strip legacy keys / values from older schemas before merge. Keeping this
-  // around so users who tested earlier builds don't end up with broken state.
   function migrate(saved) {
     if (!saved) return saved;
     const aliases = {
@@ -118,10 +110,11 @@
       delete saved.overlayFontSize;
     }
     delete saved.shadowStrength;
-    // Old px values; current schema is % of player height (≤ 10).
     for (const k of ['topFontSize', 'bottomFontSize']) {
       if (typeof saved[k] === 'number' && saved[k] > 10) delete saved[k];
     }
+    // 旧スキーマの 'auto' は廃止 — Top も明示指定。
+    if (saved.topLang === 'auto') delete saved.topLang;
     return saved;
   }
 
@@ -136,21 +129,20 @@
   function saveConfig() {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(config));
   }
-
   const config = loadConfig();
 
   // ──────────────────────────────────────────────────────────────
-  // DOM helpers (Trusted Types-safe — no innerHTML)
+  // DOM helpers (Trusted Types-safe; no innerHTML)
   // ──────────────────────────────────────────────────────────────
   function el(tag, props = {}, children = []) {
     const e = document.createElement(tag);
     for (const [k, v] of Object.entries(props)) {
-      if (k === 'style') e.style.cssText = v;
-      else if (k === 'on') for (const [ev, h] of Object.entries(v)) e.addEventListener(ev, h);
-      else if (k in e) e[k] = v;
+      if (k === 'className') e.className = v;
+      else if (k === 'textContent') e.textContent = v;
+      else if (k === 'checked') e.checked = v;
       else e.setAttribute(k, v);
     }
-    for (const c of children) e.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+    for (const c of children) e.append(typeof c === 'string' ? document.createTextNode(c) : c);
     return e;
   }
   function svg(tag, attrs = {}, children = []) {
@@ -161,135 +153,240 @@
   }
 
   // ──────────────────────────────────────────────────────────────
-  // Translation (Google client=gtx, unauthenticated, rate-limited)
+  // videoId 取得
   // ──────────────────────────────────────────────────────────────
-  const Translator = (() => {
-    const cache = new Map();
-    return {
-      async translate(text, target, source) {
-        const key = `${source}::${target}::${text}`;
-        if (cache.has(key)) return cache.get(key);
-        const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${source}&tl=${target}&dt=t&q=${encodeURIComponent(text)}`;
-        try {
-          const res = await fetch(url);
-          if (!res.ok) throw new Error(`HTTP ${res.status}`);
-          const data = await res.json();
-          const out = data[0].map(seg => seg[0]).join('');
-          if (cache.size >= MAX_CACHE) cache.delete(cache.keys().next().value);
-          cache.set(key, out);
-          return out;
-        } catch (e) {
-          console.warn('[dualsub] translate failed:', e.message);
-          return null;
+  function getCurrentVideoId() {
+    const u = new URL(location.href);
+    const v = u.searchParams.get('v');
+    if (v) return v;
+    const m = location.pathname.match(/\/(?:watch|shorts|embed|v)\/([^/?&#]+)/);
+    if (m) return m[1];
+    try {
+      const id = window.ytInitialPlayerResponse?.videoDetails?.videoId;
+      if (id) return id;
+    } catch {}
+    return null;
+  }
+
+  // ──────────────────────────────────────────────────────────────
+  // srv3 parser
+  //   <p t="ms" d="ms">...<s>word</s>...</p>
+  // ──────────────────────────────────────────────────────────────
+  function decodeEntities(s) {
+    return s
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'");
+  }
+  function parseSrv3(xml) {
+    const cues = [];
+    if (!xml) return cues;
+    const pRe = /<p\s+t="(\d+)"\s+d="(\d+)"[^>]*>([\s\S]*?)<\/p>/g;
+    let m;
+    while ((m = pRe.exec(xml)) !== null) {
+      const inner = m[3];
+      let text = '';
+      const sRe = /<s[^>]*>([^<]*)<\/s>/g;
+      let sm;
+      while ((sm = sRe.exec(inner)) !== null) text += sm[1];
+      if (!text) text = inner.replace(/<[^>]+>/g, '');
+      text = decodeEntities(text).trim();
+      if (text) cues.push({ t: +m[1], d: +m[2], text });
+    }
+    return cues;
+  }
+
+  // currentTime (ms) に該当する cue のテキストを返す。なければ ''
+  function cueAt(cues, ms) {
+    if (!cues?.length) return '';
+    let lo = 0, hi = cues.length - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      const c = cues[mid];
+      if (ms < c.t) hi = mid - 1;
+      else if (ms >= c.t + c.d) lo = mid + 1;
+      else return c.text;
+    }
+    return '';
+  }
+
+  // ──────────────────────────────────────────────────────────────
+  // CaptionStore
+  //   - InnerTube /youtubei/v1/player (ANDROID) で captionTracks を取得
+  //   - Top / Bottom 2 lane を完全対等に並列処理
+  //   - 各 lane について resolveLane で「ネイティブ手動 > asr > 翻訳 fallback」
+  //     の順で取得方針を決め、同一 URL は dedupe して 1 回だけ fetch
+  // ──────────────────────────────────────────────────────────────
+  const LANES = ['top', 'bottom'];
+  const emptyLane = wantLang => ({
+    wantLang,
+    resolvedLang: null,
+    // 'native' (希望言語の手動字幕)
+    // | 'asr'    (希望言語の自動生成字幕)
+    // | 'translated' (別言語の字幕 + tlang)
+    // | 'none'   (取得不能)
+    source: 'none',
+    cues: [],
+  });
+
+  const CaptionStore = (() => {
+    let state = {
+      videoId: null,
+      // 'idle' | 'loading' | 'ready' | 'no-captions' | 'error'
+      status: 'idle',
+      captionTracks: [],
+      isLive: false,
+      lanes: { top: emptyLane(null), bottom: emptyLane(null) },
+    };
+    let loadSeq = 0;
+    const listeners = new Set();
+
+    function emit() {
+      for (const fn of listeners) {
+        try { fn(state); } catch (e) { console.warn('[dualsub] listener error', e); }
+      }
+    }
+    function set(patch) {
+      state = { ...state, ...patch };
+      emit();
+    }
+
+    // 一つの言語コード(必ず明示指定、'auto' は無い)に対して、
+    // 「同言語の手動 > 同言語の asr > 別言語の手動 + tlang」の順で
+    // ベストな取得プランを返す。
+    function resolveLane(tracks, wantLang) {
+      if (!tracks?.length || !wantLang) return null;
+      const preferManual = list => list.find(t => t.kind !== 'asr') || list[0];
+      const matches = tracks.filter(t =>
+        t.languageCode === wantLang || t.languageCode.startsWith(wantLang + '-'));
+      if (matches.length) {
+        const t = preferManual(matches);
+        return {
+          track: t, tlang: null,
+          resolvedLang: t.languageCode,
+          source: t.kind === 'asr' ? 'asr' : 'native',
+        };
+      }
+      const base = preferManual(tracks);
+      return {
+        track: base, tlang: wantLang,
+        resolvedLang: wantLang,
+        source: 'translated',
+      };
+    }
+
+    async function fetchInnertube(videoId) {
+      const r = await fetch(INNERTUBE_URL, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ context: INNERTUBE_CONTEXT, videoId }),
+      });
+      if (!r.ok) throw new Error(`innertube ${r.status}`);
+      return r.json();
+    }
+
+    function planUrl(plan) {
+      const u = new URL(plan.track.baseUrl);
+      u.searchParams.set('fmt', 'srv3');
+      if (plan.tlang) u.searchParams.set('tlang', plan.tlang);
+      return u.toString();
+    }
+
+    async function load(videoId, wantLangs) {
+      const seq = ++loadSeq;
+      const lanesEmpty = {
+        top:    emptyLane(wantLangs.top),
+        bottom: emptyLane(wantLangs.bottom),
+      };
+      if (!videoId) {
+        set({ videoId: null, status: 'idle', captionTracks: [], isLive: false, lanes: lanesEmpty });
+        return;
+      }
+      set({ videoId, status: 'loading', captionTracks: [], isLive: false, lanes: lanesEmpty });
+      try {
+        const data = await fetchInnertube(videoId);
+        if (seq !== loadSeq) return;
+        const isLive = !!data?.videoDetails?.isLive;
+        const tracks = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
+        if (!tracks.length) {
+          set({ status: 'no-captions', captionTracks: tracks, isLive, lanes: lanesEmpty });
+          return;
         }
+        const plans = {
+          top:    resolveLane(tracks, wantLangs.top),
+          bottom: resolveLane(tracks, wantLangs.bottom),
+        };
+        // Dedupe: 同じ URL は 1 回だけ fetch
+        const xmlCache = new Map();
+        async function fetchPlan(plan) {
+          if (!plan) return [];
+          const url = planUrl(plan);
+          if (!xmlCache.has(url)) {
+            xmlCache.set(url, fetch(url, { credentials: 'include' }).then(r => {
+              if (!r.ok) throw new Error(`timedtext ${r.status}`);
+              return r.text();
+            }));
+          }
+          const xml = await xmlCache.get(url);
+          return parseSrv3(xml);
+        }
+        const [topCues, bottomCues] = await Promise.all([
+          fetchPlan(plans.top),
+          fetchPlan(plans.bottom),
+        ]);
+        if (seq !== loadSeq) return;
+        const lanes = {
+          top: plans.top ? {
+            wantLang: wantLangs.top,
+            resolvedLang: plans.top.resolvedLang,
+            source: plans.top.source,
+            cues: topCues,
+          } : emptyLane(wantLangs.top),
+          bottom: plans.bottom ? {
+            wantLang: wantLangs.bottom,
+            resolvedLang: plans.bottom.resolvedLang,
+            source: plans.bottom.source,
+            cues: bottomCues,
+          } : emptyLane(wantLangs.bottom),
+        };
+        set({ status: 'ready', captionTracks: tracks, isLive, lanes });
+      } catch (e) {
+        if (seq !== loadSeq) return;
+        console.warn('[dualsub] caption load failed:', e.message);
+        set({ status: 'error' });
+      }
+    }
+
+    return {
+      load,
+      onChange(fn) { listeners.add(fn); return () => listeners.delete(fn); },
+      get state() { return state; },
+      cueAt(ms) {
+        return {
+          top:    cueAt(state.lanes.top.cues, ms),
+          bottom: cueAt(state.lanes.bottom.cues, ms),
+        };
       },
     };
   })();
 
   // ──────────────────────────────────────────────────────────────
-  // YT caption state detection + best-effort enable
+  // Page / Player detection
   // ──────────────────────────────────────────────────────────────
-  // ON シグナルを 3 経路で検査。1 つでも ON なら true。OFF 確定はしない。
-  // 観測は sticky: 一度 ON が見えたら以降 false にはしない(誤って 'c' 連打して
-  // 字幕を消してしまうのを避けるため)。
-  function detectCaptionSignal() {
-    // 1. 実テキストが描画されている = 確実に ON(最強シグナル)
-    if (getCurrentCaption()) return true;
-    // 2. <video>.textTracks に showing なものがあれば ON
-    const video = document.querySelector('video');
-    if (video?.textTracks) {
-      for (const t of video.textTracks) if (t.mode === 'showing') return true;
-    }
-    // 3. CC ボタンが aria-pressed=true を示していれば ON
-    const btn = document.querySelector(SEL.ccButton);
-    if (btn?.getAttribute('aria-pressed') === 'true') return true;
+  // 通常の動画再生ページ(watch / embed / v)でのみ UI を出す。
+  // shorts はスワイプ操作・自動再生・縦動画 UI が前提で字幕オーバーレイの
+  // 価値が薄く、ホームや検索結果でも hover プレビューで <video> が存在する
+  // ため、DOM ではなく URL で判定する。
+  function isWatchPage() {
+    const path = location.pathname;
+    if (path === '/watch') return true;                   // /watch?v=...
+    if (/^\/(embed|v)\/[^/?&#]+/.test(path)) return true; // /embed/ID, /v/ID
     return false;
   }
 
-  // 観察結果を即時反映(非 sticky)。attemptYtSync 中の判定は detectCaptionSignal を直接呼ぶ。
-  function updateYtCaptionState() {
-    ytCaptionsOn = detectCaptionSignal();
-  }
-
-  // YT 字幕 ON: CC ボタン click → 'c' キー dispatch
-  function tryEnableYtCaptions() {
-    const btn = document.querySelector(SEL.ccButton);
-    if (btn && btn.getAttribute('aria-pressed') === 'false' &&
-        btn.getAttribute('aria-disabled') !== 'true') {
-      btn.click();
-      return;
-    }
-    dispatchCKey();
-  }
-
-  // YT 字幕 OFF: CC ボタン click(押されていれば) → 'c' キー dispatch(c はトグル)
-  function tryDisableYtCaptions() {
-    const btn = document.querySelector(SEL.ccButton);
-    if (btn && btn.getAttribute('aria-pressed') === 'true' &&
-        btn.getAttribute('aria-disabled') !== 'true') {
-      btn.click();
-      return;
-    }
-    dispatchCKey();
-  }
-
-  function dispatchCKey() {
-    const init = { key: 'c', code: 'KeyC', keyCode: 67, which: 67, bubbles: true, cancelable: true };
-    const targets = [
-      document.querySelector('video'),
-      document.querySelector('#movie_player'),
-      document.querySelector('.html5-video-player'),
-      document.body,
-    ].filter(Boolean);
-    for (const t of targets) {
-      t.dispatchEvent(new KeyboardEvent('keydown', init));
-      t.dispatchEvent(new KeyboardEvent('keyup', init));
-    }
-  }
-
-  // YT の字幕状態を targetOn に揃えに行く双方向シンク。
-  //   - opts.initialDelay: 観察猶予(プレーヤーロード直後など)
-  //   - 試行 → verifyDelay 待機 → 一致確認、を maxAttempts 回まで繰り返す
-  //   - 全失敗時は YT の実状態に合わせて config.enabled を revert
-  //   - syncSeq による上書きで古い操作はサイレント終了
-  async function attemptYtSync(targetOn, opts = {}) {
-    const { initialDelay = 0, verifyDelay = 1500, maxAttempts = 2 } = opts;
-    const seq = ++syncSeq;
-    const matches = () => detectCaptionSignal() === targetOn;
-
-    if (initialDelay > 0) {
-      await sleep(initialDelay);
-      if (seq !== syncSeq) return;
-    }
-    if (matches()) { ytCaptionsOn = targetOn; return; }
-
-    for (let i = 0; i < maxAttempts; i++) {
-      if (targetOn) tryEnableYtCaptions();
-      else tryDisableYtCaptions();
-      await sleep(verifyDelay);
-      if (seq !== syncSeq) return;
-      if (matches()) { ytCaptionsOn = targetOn; return; }
-    }
-
-    // 全試行失敗 → YT 実状態に合わせて自分の state を補正
-    const ytActual = detectCaptionSignal();
-    ytCaptionsOn = ytActual;
-    if (ytActual !== config.enabled) {
-      console.log(`[dualsub] sync failed; aligning toggle to YT state (${ytActual ? 'on' : 'off'})`);
-      config.enabled = ytActual;
-      ui.inputs.cbEnabled.checked = ytActual;
-      saveConfig();
-      applyOverlayStyle();
-      syncStatusDot();
-    }
-  }
-
-  // ──────────────────────────────────────────────────────────────
-  // Player detection
-  //   The known ID is preferred. Fallback: walk up from <video> until we hit a
-  //   positioned ancestor — we need a positioned container to absolutely
-  //   place our overlay on the video.
-  // ──────────────────────────────────────────────────────────────
   function findPlayer() {
     const known = document.querySelector(SEL.player);
     if (known) return known;
@@ -301,16 +398,8 @@
     }
     return video.parentElement;
   }
-
-  // ──────────────────────────────────────────────────────────────
-  // Caption scraping
-  // ──────────────────────────────────────────────────────────────
-  function getCurrentCaption() {
-    for (const sel of SEL.captionTexts) {
-      const els = document.querySelectorAll(sel);
-      if (els.length) return [...els].map(e => e.textContent).join(' ').trim();
-    }
-    return '';
+  function findVideo() {
+    return player?.querySelector('video') || document.querySelector('video');
   }
 
   // ──────────────────────────────────────────────────────────────
@@ -337,33 +426,50 @@
     root.style.setProperty('--ds-bg-opacity', String(config.bgOpacity / 100));
     computeFontSizes();
     overlay.style.display = config.enabled ? 'flex' : 'none';
-    document.body.classList.toggle('dualsub-active', config.enabled);
+    // YT 純正字幕は常に非表示(プレーヤーがマウントされている間のみ)
+    document.body.classList.toggle('dualsub-active', !!player);
   }
 
   function clearOverlay() {
     overlayOriginal.textContent = '';
     overlayTranslated.textContent = '';
+    overlayOriginal.classList.remove('ds-placeholder');
+    overlayTranslated.classList.remove('ds-placeholder');
   }
 
-  async function updateOverlay() {
-    maybeHandleNavigation();
-    updateYtCaptionState();
-    if (!config.enabled) {
+  function renderPlaceholder(msg) {
+    overlayOriginal.textContent = '';
+    overlayOriginal.classList.remove('ds-placeholder');
+    overlayTranslated.textContent = msg;
+    overlayTranslated.classList.add('ds-placeholder');
+  }
+
+  function updateOverlay() {
+    if (!config.enabled || !player) {
       clearOverlay();
-      lastText = '';
       return;
     }
-    const text = getCurrentCaption();
-    if (text === lastText) return;
-    lastText = text;
-    if (!text) { clearOverlay(); return; }
-    overlayOriginal.textContent = text;
-    overlayTranslated.style.opacity = '0.4';
-    const seq = ++updateSeq;
-    const translated = await Translator.translate(text, config.bottomLang, config.topLang);
-    if (seq !== updateSeq) return;  // newer subtitle already in flight
-    overlayTranslated.style.opacity = '1';
-    overlayTranslated.textContent = translated || '';
+    const s = CaptionStore.state;
+    if (s.status === 'idle' || s.status === 'loading') {
+      clearOverlay();
+      return;
+    }
+    if (s.status === 'no-captions') {
+      renderPlaceholder(s.isLive ? '字幕なし(ライブ)' : '字幕なし');
+      return;
+    }
+    if (s.status === 'error') {
+      renderPlaceholder('字幕取得失敗');
+      return;
+    }
+    const video = findVideo();
+    if (!video) { clearOverlay(); return; }
+    const ms = (video.currentTime || 0) * 1000;
+    const { top, bottom } = CaptionStore.cueAt(ms);
+    overlayOriginal.textContent = top;
+    overlayTranslated.textContent = bottom;
+    overlayOriginal.classList.remove('ds-placeholder');
+    overlayTranslated.classList.remove('ds-placeholder');
   }
 
   function maybeHandleNavigation() {
@@ -372,10 +478,13 @@
     setTimeout(syncMountState, 500);
   }
 
-  // Show the bar/overlay only when there's a player on the page. Hides on
-  // homepage/search, re-mounts when navigating into a watch page.
+  // Show the bar/overlay only on watch pages. Also detects videoId changes
+  // (SPA navigation) and triggers CaptionStore reload.
   function syncMountState() {
-    const found = findPlayer();
+    // 1) Watch ページ以外なら UI を出さない(ホームや検索結果ではプレビュー
+    //    再生で <video> が存在するため、findPlayer だけでは不十分)
+    const onWatch = isWatchPage();
+    const found = onWatch ? findPlayer() : null;
 
     if (!found) {
       ui.panel.style.display = 'none';
@@ -384,6 +493,10 @@
       player = null;
       playerResizeObs?.disconnect();
       playerResizeObs = null;
+      // 動画ページから外れたタイミングで CaptionStore も idle に戻す。
+      if (!onWatch && CaptionStore.state.videoId !== null) {
+        CaptionStore.load(null, { top: config.topLang, bottom: config.bottomLang });
+      }
       return;
     }
 
@@ -393,6 +506,7 @@
     if (alreadyMounted) {
       ui.panel.style.display = '';
       applyOverlayStyle();
+      maybeReloadCaptions();
       return;
     }
 
@@ -406,9 +520,15 @@
     playerResizeObs = new ResizeObserver(computeFontSizes);
     playerResizeObs.observe(found);
 
-    // 新規プレーヤーごとに一度だけ、保存された config.enabled に向けて同期試行。
-    // initialDelay=3s で YT が既に字幕を出している場合の検出機会を確保する。
-    attemptYtSync(config.enabled, { initialDelay: 3000 });
+    maybeReloadCaptions();
+  }
+
+  function maybeReloadCaptions() {
+    const videoId = getCurrentVideoId();
+    if (!videoId) return;
+    if (videoId !== CaptionStore.state.videoId) {
+      CaptionStore.load(videoId, { top: config.topLang, bottom: config.bottomLang });
+    }
   }
 
   // ──────────────────────────────────────────────────────────────
@@ -418,17 +538,32 @@
     const s = el('style');
     s.textContent = `
       :root {
-        --ds-accent: #4fc3f7;
-        --ds-accent-glow: rgba(79,195,247,0.45);
-        --ds-bg: rgba(15,18,24,0.78);
-        --ds-bg-strong: rgba(15,18,24,0.92);
-        --ds-border: rgba(255,255,255,0.12);
-        --ds-text: #f3f5f8;
-        --ds-text-dim: rgba(243,245,248,0.55);
+        /* Theme — accent palette */
+        --ds-accent:        #4fc3f7;
+        --ds-accent-soft:   var(--ds-accent-soft);   /* slider thumb halo / focus ring */
+        --ds-accent-glow:   rgba(79,195,247,0.45);   /* pulse / hover glow */
+
+        /* Status — loading (warning) */
+        --ds-warn:          #ffb74d;
+        --ds-warn-border:   rgba(255,183,77,0.65);
+        --ds-warn-glow:     rgba(255,183,77,0.4);
+
+        /* Status — error */
+        --ds-error:         #ef5350;
+        --ds-error-border:  rgba(239,83,80,0.7);
+
+        /* Surfaces */
+        --ds-bg:            rgba(15,18,24,0.78);
+        --ds-bg-strong:     rgba(15,18,24,0.92);
+
+        /* Lines / text */
+        --ds-border:        rgba(255,255,255,0.12);
+        --ds-text:          #f3f5f8;
+        --ds-text-dim:      rgba(243,245,248,0.55);
       }
 
-      /* When the overlay is active, hide YouTube's native caption rendering
-         (we replace it with our own). */
+      /* While DualSub is mounted, hide YouTube's native caption rendering
+         (we replace it with our own — always, regardless of overlay toggle). */
       body.dualsub-active .caption-window,
       body.dualsub-active .ytp-caption-window-container,
       body.dualsub-active .ytp-caption-window-bottom,
@@ -470,129 +605,137 @@
       }
       #dualsub-overlay .ds-original   { color: var(--ds-top-color, #fff); font-size: var(--ds-top-size, 22px); }
       #dualsub-overlay .ds-translated { color: var(--ds-bottom-color, #4fc3f7); font-size: var(--ds-bottom-size, 19px); }
+      #dualsub-overlay .ds-translated.ds-placeholder { opacity: 0.6; font-weight: 600; }
       #dualsub-overlay .ds-original:empty,
       #dualsub-overlay .ds-translated:empty { display: none; }
 
       /* Bar + panel */
       #dualsub-panel {
         position: fixed;
-        bottom: max(12px, env(safe-area-inset-bottom, 12px));
+        bottom: max(10px, env(safe-area-inset-bottom, 10px));
         left: 50%; transform: translateX(-50%);
         z-index: 99999;
         font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", "Hiragino Sans", "Yu Gothic UI", Roboto, sans-serif;
-        font-size: 13px; color: var(--ds-text);
+        font-size: 12px; color: var(--ds-text);
         display: flex; flex-direction: column-reverse; align-items: stretch;
-        width: min(480px, calc(100vw - 24px));
+        width: min(440px, calc(100vw - 16px));
+        box-sizing: border-box;
       }
       #dualsub-toggle {
-        all: unset; box-sizing: border-box; cursor: pointer; pointer-events: auto;
-        width: 100%; height: 52px;
+        box-sizing: border-box; cursor: pointer; pointer-events: auto;
+        width: 100%; height: 44px;
         display: flex; align-items: center; justify-content: space-between;
-        padding: 0 18px;
+        gap: 8px;
+        padding: 0 12px;
         background: linear-gradient(135deg, var(--ds-bg) 0%, var(--ds-bg-strong) 100%);
         backdrop-filter: blur(16px) saturate(180%);
         -webkit-backdrop-filter: blur(16px) saturate(180%);
         border: 1px solid var(--ds-border);
-        border-radius: 26px;
+        border-radius: 22px;
         box-shadow:
-          0 10px 32px rgba(0,0,0,0.45),
-          0 2px 8px rgba(0,0,0,0.3),
+          0 8px 24px rgba(0,0,0,0.45),
+          0 2px 6px rgba(0,0,0,0.3),
           inset 0 1px 0 rgba(255,255,255,0.08);
         transition: transform 0.18s cubic-bezier(0.2,0.8,0.2,1), box-shadow 0.18s ease, border-color 0.18s ease;
         color: var(--ds-text);
+        font: inherit; user-select: none;
+        -webkit-tap-highlight-color: transparent;
       }
       #dualsub-toggle:hover {
-        transform: translateY(-2px);
         border-color: rgba(255,255,255,0.2);
         box-shadow:
-          0 16px 40px rgba(0,0,0,0.55),
-          0 4px 12px rgba(0,0,0,0.35),
+          0 12px 32px rgba(0,0,0,0.55),
+          0 4px 10px rgba(0,0,0,0.35),
           inset 0 1px 0 rgba(255,255,255,0.12),
-          0 0 0 4px var(--ds-accent-glow);
+          0 0 0 3px var(--ds-accent-glow);
       }
-      #dualsub-toggle:active { transform: translateY(0); }
-
-      .ds-bar-left  { display: flex; align-items: center; gap: 10px; }
-      .ds-bar-right { display: flex; align-items: center; gap: 12px; }
-
-      .ds-status-dot {
-        width: 8px; height: 8px; border-radius: 50%;
-        background: var(--ds-accent);
-        animation: ds-pulse 2.2s ease-out infinite;
-      }
-      .ds-status-dot.ds-off { background: rgba(255,255,255,0.25); animation: none; }
-      @keyframes ds-pulse {
-        0%   { box-shadow: 0 0 0 0 var(--ds-accent-glow); }
-        70%  { box-shadow: 0 0 0 10px rgba(79,195,247,0); }
-        100% { box-shadow: 0 0 0 0 rgba(79,195,247,0); }
+      #dualsub-toggle:focus-visible { outline: 2px solid var(--ds-accent); outline-offset: 2px; }
+      /* バー全体に状態色を反映(脈動 = loading) */
+      #dualsub-toggle.ds-loading { border-color: var(--ds-warn-border); animation: ds-bar-pulse 1.1s ease-out infinite; }
+      #dualsub-toggle.ds-error   { border-color: var(--ds-error-border); }
+      @keyframes ds-bar-pulse {
+        0%   { box-shadow: 0 8px 24px rgba(0,0,0,0.45), 0 2px 6px rgba(0,0,0,0.3), inset 0 1px 0 rgba(255,255,255,0.08), 0 0 0 0 var(--ds-warn-glow); }
+        70%  { box-shadow: 0 8px 24px rgba(0,0,0,0.45), 0 2px 6px rgba(0,0,0,0.3), inset 0 1px 0 rgba(255,255,255,0.08), 0 0 0 6px transparent; }
+        100% { box-shadow: 0 8px 24px rgba(0,0,0,0.45), 0 2px 6px rgba(0,0,0,0.3), inset 0 1px 0 rgba(255,255,255,0.08), 0 0 0 0 transparent; }
       }
 
-      .ds-brand { font-weight: 700; letter-spacing: 0.02em; font-size: 14px; color: var(--ds-text); }
+      .ds-bar-left  { display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1 1 auto; }
+      .ds-bar-right { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+
+      .ds-brand {
+        font-weight: 700; letter-spacing: 0.01em; font-size: 13px;
+        color: var(--ds-text);
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      }
       .ds-brand .ds-accent { color: var(--ds-accent); }
 
       .ds-lang-pair {
-        display: flex; align-items: center; gap: 7px;
-        padding: 4px 11px;
+        display: flex; align-items: center; gap: 5px;
+        padding: 3px 9px;
         background: rgba(255,255,255,0.06);
         border: 1px solid var(--ds-border);
         border-radius: 999px;
-        font-size: 11px; font-weight: 700; letter-spacing: 0.05em;
+        font-size: 10px; font-weight: 700; letter-spacing: 0.04em;
         text-transform: uppercase;
+        white-space: nowrap;
       }
-      .ds-lang-pair .ds-arrow         { color: var(--ds-text-dim); font-weight: 400; opacity: 0.6; }
-      .ds-lang-pair .ds-lang-top      { color: var(--ds-top-color, #fff); }
-      .ds-lang-pair .ds-lang-bottom   { color: var(--ds-bottom-color, #4fc3f7); }
+      .ds-lang-pair .ds-arrow       { color: var(--ds-text-dim); font-weight: 400; opacity: 0.6; }
+      .ds-lang-pair .ds-lang-top    { color: var(--ds-top-color, #fff); }
+      .ds-lang-pair .ds-lang-bottom { color: var(--ds-bottom-color, #4fc3f7); }
 
       .ds-chevron {
-        width: 16px; height: 16px; color: var(--ds-text-dim);
+        width: 14px; height: 14px; color: var(--ds-text-dim);
         transition: transform 0.25s cubic-bezier(0.2,0.8,0.2,1), color 0.18s;
+        flex: 0 0 auto;
       }
       #dualsub-panel.dualsub-open .ds-chevron { transform: rotate(180deg); color: var(--ds-accent); }
 
       #dualsub-body {
-        margin-bottom: 10px; width: 100%;
+        margin-bottom: 8px; width: 100%;
+        box-sizing: border-box;
         overflow-y: auto;
         background: linear-gradient(180deg, var(--ds-bg-strong) 0%, var(--ds-bg) 100%);
         backdrop-filter: blur(20px) saturate(180%);
         -webkit-backdrop-filter: blur(20px) saturate(180%);
         border: 1px solid var(--ds-border);
-        border-radius: 20px;
-        padding: 18px 18px 16px;
+        border-radius: 16px;
+        padding: 12px 14px;
         display: none;
-        box-shadow: 0 -12px 40px rgba(0,0,0,0.5), inset 0 1px 0 rgba(255,255,255,0.06);
-        opacity: 0; transform: translateY(8px);
-        transition: opacity 0.2s ease, transform 0.2s cubic-bezier(0.2,0.8,0.2,1);
+        box-shadow: 0 -10px 32px rgba(0,0,0,0.5), inset 0 1px 0 rgba(255,255,255,0.06);
+        opacity: 0; transform: translateY(6px);
+        transition: opacity 0.18s ease, transform 0.18s cubic-bezier(0.2,0.8,0.2,1);
       }
       #dualsub-panel.dualsub-open #dualsub-body { display: block; opacity: 1; transform: translateY(0); }
 
       .ds-body-header {
-        font-size: 11px; font-weight: 600; letter-spacing: 0.1em;
+        font-size: 10px; font-weight: 600; letter-spacing: 0.1em;
         text-transform: uppercase; color: var(--ds-text-dim);
-        margin-bottom: 14px; padding-bottom: 10px;
+        margin-bottom: 10px; padding-bottom: 7px;
         border-bottom: 1px solid var(--ds-border);
       }
-      .ds-grid { display: flex; flex-direction: column; gap: 12px; }
-      .ds-row  { display: flex; flex-direction: column; gap: 6px; }
+      .ds-grid { display: flex; flex-direction: column; gap: 8px; }
+      .ds-row  { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 
       .ds-group {
-        display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
-        padding: 12px 14px 14px;
+        display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
+        padding: 8px 10px 10px;
         background: rgba(255,255,255,0.025);
         border: 1px solid var(--ds-border);
-        border-radius: 12px;
+        border-radius: 10px;
+        min-width: 0;
       }
       .ds-group-header {
         grid-column: 1 / -1;
-        display: flex; align-items: center; gap: 8px;
-        font-size: 10px; font-weight: 700;
-        letter-spacing: 0.14em; text-transform: uppercase;
+        display: flex; align-items: center; gap: 6px;
+        font-size: 9px; font-weight: 700;
+        letter-spacing: 0.12em; text-transform: uppercase;
         color: var(--ds-text-dim);
-        padding-bottom: 4px;
+        padding-bottom: 2px;
       }
       .ds-group-dot {
-        width: 10px; height: 10px; border-radius: 50%;
+        width: 8px; height: 8px; border-radius: 50%;
         display: inline-block;
-        box-shadow: 0 0 0 1px rgba(255,255,255,0.18), 0 0 8px currentColor;
+        box-shadow: 0 0 0 1px rgba(255,255,255,0.18), 0 0 6px currentColor;
       }
       .ds-group .ds-row.ds-wide { grid-column: 1 / -1; }
       .ds-group-top    .ds-group-dot { color: var(--ds-top-color,    #fff);     background: var(--ds-top-color,    #fff);     }
@@ -600,11 +743,11 @@
 
       .ds-label {
         display: flex; justify-content: space-between; align-items: baseline;
-        color: var(--ds-text-dim); font-size: 11px;
+        color: var(--ds-text-dim); font-size: 10px;
         font-weight: 600; letter-spacing: 0.04em;
         text-transform: uppercase;
       }
-      .ds-value { color: var(--ds-accent); font-size: 11px; font-weight: 600; }
+      .ds-value { color: var(--ds-accent); font-size: 10px; font-weight: 600; }
 
       .ds-row select,
       .ds-row input[type=range],
@@ -613,18 +756,18 @@
         background: rgba(255,255,255,0.06);
         color: var(--ds-text);
         border: 1px solid var(--ds-border);
-        border-radius: 10px;
-        font-size: 13px;
+        border-radius: 8px;
+        font-size: 12px;
         transition: border-color 0.15s ease, background 0.15s ease;
       }
       .ds-row select {
-        padding: 8px 28px 8px 10px;
+        padding: 7px 24px 7px 9px; height: 32px;
         appearance: none; -webkit-appearance: none;
         background-image:
           linear-gradient(45deg,  transparent 50%, var(--ds-text-dim) 50%),
           linear-gradient(135deg, var(--ds-text-dim) 50%, transparent 50%);
-        background-position: calc(100% - 16px) 50%, calc(100% - 11px) 50%;
-        background-size: 5px 5px, 5px 5px;
+        background-position: calc(100% - 13px) 50%, calc(100% - 9px) 50%;
+        background-size: 4px 4px, 4px 4px;
         background-repeat: no-repeat;
       }
       .ds-row select:hover, .ds-row select:focus,
@@ -641,25 +784,26 @@
       .ds-row input[type=range]::-webkit-slider-runnable-track { height: 4px; border-radius: 999px; background: rgba(255,255,255,0.12); }
       .ds-row input[type=range]::-webkit-slider-thumb {
         -webkit-appearance: none; appearance: none;
-        width: 16px; height: 16px; border-radius: 50%;
+        width: 18px; height: 18px; border-radius: 50%;
         background: var(--ds-accent);
-        margin-top: -6px;
-        box-shadow: 0 0 0 4px rgba(79,195,247,0.15), 0 2px 6px rgba(0,0,0,0.4);
+        margin-top: -7px;
+        box-shadow: 0 0 0 4px var(--ds-accent-soft), 0 2px 6px rgba(0,0,0,0.4);
         cursor: pointer; transition: transform 0.12s ease;
       }
-      .ds-row input[type=range]::-webkit-slider-thumb:hover { transform: scale(1.15); }
+      .ds-row input[type=range]::-webkit-slider-thumb:hover { transform: scale(1.12); }
       .ds-row input[type=range]::-moz-range-track { height: 4px; border-radius: 999px; background: rgba(255,255,255,0.12); }
       .ds-row input[type=range]::-moz-range-thumb {
-        width: 16px; height: 16px; border-radius: 50%; border: none;
+        width: 18px; height: 18px; border-radius: 50%; border: none;
         background: var(--ds-accent);
-        box-shadow: 0 0 0 4px rgba(79,195,247,0.15);
+        box-shadow: 0 0 0 4px var(--ds-accent-soft);
         cursor: pointer;
       }
-      .ds-row input[type=color] { height: 36px; padding: 4px; cursor: pointer; }
+      .ds-row input[type=color] { height: 30px; padding: 3px; cursor: pointer; }
       .ds-row input[type=color]::-webkit-color-swatch-wrapper { padding: 0; }
-      .ds-row input[type=color]::-webkit-color-swatch { border: none; border-radius: 6px; }
+      .ds-row input[type=color]::-webkit-color-swatch { border: none; border-radius: 5px; }
 
-      .ds-switch { position: relative; display: inline-block; width: 38px; height: 22px; }
+      /* Switch (used both on the bar and elsewhere) */
+      .ds-switch { position: relative; display: inline-block; width: 38px; height: 22px; flex: 0 0 auto; }
       .ds-switch input { opacity: 0; width: 0; height: 0; }
       .ds-switch-slider {
         position: absolute; inset: 0; cursor: pointer;
@@ -677,15 +821,17 @@
       .ds-switch input:checked + .ds-switch-slider { background: var(--ds-accent); }
       .ds-switch input:checked + .ds-switch-slider::before { transform: translateX(16px); }
 
-      .ds-row.ds-toggle-row {
-        flex-direction: row; align-items: center; justify-content: space-between;
-        padding: 4px 0 8px;
-        border-bottom: 1px solid var(--ds-border);
-        margin-bottom: 4px;
-      }
-      .ds-row.ds-toggle-row .ds-label {
-        flex: 1; color: var(--ds-text);
-        font-size: 13px; text-transform: none; letter-spacing: 0;
+      /* 狭幅(< 400px):2 列 → 1 列、フォントと余白をさらに詰める */
+      @media (max-width: 400px) {
+        #dualsub-panel { width: calc(100vw - 12px); font-size: 11px; }
+        #dualsub-toggle { padding: 0 10px; height: 42px; gap: 6px; }
+        .ds-brand { font-size: 12px; }
+        .ds-lang-pair { padding: 2px 7px; font-size: 9px; gap: 4px; }
+        .ds-chevron { width: 13px; height: 13px; }
+        #dualsub-body { padding: 10px 12px; border-radius: 14px; }
+        .ds-group { grid-template-columns: 1fr; gap: 6px; padding: 8px 10px; }
+        .ds-grid { gap: 6px; }
+        .ds-row select { font-size: 12px; height: 30px; }
       }
     `;
     return s;
@@ -694,16 +840,13 @@
   // ──────────────────────────────────────────────────────────────
   // UI factory
   // ──────────────────────────────────────────────────────────────
-  // Display sizes as ×10 percent (3.5 → "35%") so the slider numbers feel
-  // human-friendly without changing the underlying value.
   const fmtSize = v => {
     const d = v * 10;
     return (d === Math.floor(d) ? d.toFixed(0) : d.toFixed(1)) + '%';
   };
 
-  function buildLangSelect(includeAuto, value) {
+  function buildLangSelect(value) {
     const s = el('select');
-    if (includeAuto) s.add(new Option('自動判定', 'auto'));
     for (const l of LANGS) s.add(new Option(l.name, l.code));
     s.value = value;
     return s;
@@ -731,8 +874,11 @@
   }
 
   function buildUI() {
-    // — Bar —
-    const statusDot = el('span', { className: 'ds-status-dot' });
+    // バー上の ON/OFF スイッチ(設定パネルを開かずに切り替え可能)
+    const cbEnabled = el('input', { type: 'checkbox', checked: config.enabled });
+    const barSwitch = el('label', { className: 'ds-switch', 'aria-label': '字幕オン/オフ' }, [
+      cbEnabled, el('span', { className: 'ds-switch-slider' }),
+    ]);
     const brand     = el('span', { className: 'ds-brand' }, [
       'Dual', el('span', { className: 'ds-accent' }, ['Sub']),
     ]);
@@ -747,25 +893,20 @@
       'stroke-width': '2.5', 'stroke-linecap': 'round', 'stroke-linejoin': 'round',
     }, [svg('polyline', { points: '6 15 12 9 18 15' })]);
 
-    const toggleBtn = el('button', { id: 'dualsub-toggle', type: 'button' }, [
-      el('span', { className: 'ds-bar-left'  }, [statusDot, brand]),
+    // バーは div(button だと内側 label+input がネスト interactive で invalid)。
+    // 展開クリックはバー全体で受け、ds-switch 内クリックだけ無視する。
+    const toggleBtn = el('div', { id: 'dualsub-toggle', role: 'button', tabindex: '0' }, [
+      el('span', { className: 'ds-bar-left'  }, [barSwitch, brand]),
       el('span', { className: 'ds-bar-right' }, [langPair, chevron]),
     ]);
 
-    // — Body —
-    const cbEnabled = el('input', { type: 'checkbox', checked: config.enabled });
-    const rowEnabled = el('div', { className: 'ds-row ds-toggle-row' }, [
-      el('span', { className: 'ds-label' }, ['オーバーレイ表示']),
-      el('label', { className: 'ds-switch' }, [cbEnabled, el('span', { className: 'ds-switch-slider' })]),
-    ]);
-
-    const selTopLang   = buildLangSelect(true,  config.topLang);
+    const selTopLang   = buildLangSelect(config.topLang);
     const inTopColor   = el('input', { type: 'color', value: config.topColor });
     const inTopSize    = el('input', { type: 'range', min: '1', max: '10', step: '0.25', value: String(config.topFontSize) });
     const topSizeVal   = el('span', { className: 'ds-value' }, [fmtSize(config.topFontSize)]);
     const topGroup     = buildGroup('top', selTopLang, inTopColor, inTopSize, topSizeVal);
 
-    const selBottomLang = buildLangSelect(false, config.bottomLang);
+    const selBottomLang = buildLangSelect(config.bottomLang);
     const inBottomColor = el('input', { type: 'color', value: config.bottomColor });
     const inBottomSize  = el('input', { type: 'range', min: '1', max: '10', step: '0.25', value: String(config.bottomFontSize) });
     const bottomSizeVal = el('span', { className: 'ds-value' }, [fmtSize(config.bottomFontSize)]);
@@ -779,7 +920,7 @@
     const bgOpacityVal = el('span', { className: 'ds-value' }, [`${config.bgOpacity}%`]);
     const rowBgOpacity = buildRow('背景の濃さ', bgOpacityVal, inBgOpacity);
 
-    const grid = el('div', { className: 'ds-grid' }, [rowEnabled, topGroup, bottomGroup, rowPos, rowBgOpacity]);
+    const grid = el('div', { className: 'ds-grid' }, [topGroup, bottomGroup, rowPos, rowBgOpacity]);
     const body = el('div', { id: 'dualsub-body' }, [
       el('div', { className: 'ds-body-header' }, ['Subtitle Settings']),
       grid,
@@ -787,7 +928,7 @@
     const panel = el('div', { id: 'dualsub-panel' }, [toggleBtn, body]);
 
     return {
-      panel, toggleBtn, statusDot, langTop, langBottom,
+      panel, toggleBtn, langTop, langBottom,
       inputs: { cbEnabled, selTopLang, selBottomLang, inTopColor, inBottomColor, inTopSize, inBottomSize, inPos, inBgOpacity },
       vals:   { topSizeVal, bottomSizeVal, posVal, bgOpacityVal },
     };
@@ -798,17 +939,24 @@
   // ──────────────────────────────────────────────────────────────
   // UI sync helpers
   // ──────────────────────────────────────────────────────────────
-  function syncStatusDot() {
-    ui.statusDot.classList.toggle('ds-off', !config.enabled);
+  // バー自体に状態クラスを付け、ロード状態を視覚化(loading 中はアクセント色の脈動)
+  function syncBarStatus() {
+    const s = CaptionStore.state.status;
+    const cls = ui.toggleBtn.classList;
+    cls.toggle('ds-off',     !config.enabled);
+    cls.toggle('ds-loading', config.enabled && s === 'loading');
+    cls.toggle('ds-error',   config.enabled && s === 'error');
   }
+
   function updateLangPair() {
-    ui.langTop.textContent    = config.topLang === 'auto' ? 'AUTO' : config.topLang.toUpperCase();
+    ui.langTop.textContent    = config.topLang.toUpperCase();
     ui.langBottom.textContent = config.bottomLang.toUpperCase();
   }
 
   function onUiInput() {
     const { inputs, vals } = ui;
-    const wasEnabled = config.enabled;
+    const prevTopLang    = config.topLang;
+    const prevBottomLang = config.bottomLang;
 
     config.enabled        = inputs.cbEnabled.checked;
     config.topLang        = inputs.selTopLang.value;
@@ -828,13 +976,12 @@
     saveConfig();
     applyOverlayStyle();
     updateLangPair();
-    syncStatusDot();
-    lastText = '';  // force re-render with new translation target / style
+    syncBarStatus();
 
-    // トグル変化に追随して YT 側を ON/OFF 同期。失敗時は YT 実状態に
-    // 合わせて config.enabled を revert する(attemptYtSync 内で処理)。
-    if (wasEnabled !== config.enabled) {
-      attemptYtSync(config.enabled);
+    // 言語変更があれば字幕を取り直す。
+    if (prevTopLang !== config.topLang || prevBottomLang !== config.bottomLang) {
+      const videoId = getCurrentVideoId();
+      if (videoId) CaptionStore.load(videoId, { top: config.topLang, bottom: config.bottomLang });
     }
   }
 
@@ -844,18 +991,15 @@
   const styleEl = buildStyle();
   document.head.appendChild(styleEl);
 
-  // Mount the panel hidden — syncMountState() will show it when a player exists.
   ui.panel.style.display = 'none';
   overlay.style.display = 'none';
   document.body.appendChild(ui.panel);
 
   updateLangPair();
-  syncStatusDot();
+  syncBarStatus();
   applyOverlayStyle();
   syncMountState();
 
-  // The panel body's height comes from JS, not CSS, because WebView
-  // sometimes computes calc(100vh - X) to 0px.
   function updatePanelMaxHeight() {
     const body = ui.panel.querySelector('#dualsub-body');
     if (body) body.style.maxHeight = `${Math.max(240, window.innerHeight - 120)}px`;
@@ -864,27 +1008,42 @@
   window.addEventListener('resize', updatePanelMaxHeight);
   cleanups.push(() => window.removeEventListener('resize', updatePanelMaxHeight));
 
-  // Watch captions + check player presence on the same poll.
-  const captionObserver = new MutationObserver(updateOverlay);
-  captionObserver.observe(document.body, { childList: true, subtree: true, characterData: true });
-  cleanups.push(() => captionObserver.disconnect());
+  // 字幕状態の変化(loading/ready/error)を UI に反映。
+  const offCaption = CaptionStore.onChange(() => {
+    updateLangPair();
+    syncBarStatus();
+    updateOverlay();
+  });
+  cleanups.push(offCaption);
 
-  const poll = setInterval(() => { syncMountState(); updateOverlay(); }, POLL_MS);
+  // 表示更新ループ。currentTime ベースなので軽量(DOM 走査も翻訳 fetch も無い)。
+  const poll = setInterval(() => {
+    maybeHandleNavigation();
+    syncMountState();
+    updateOverlay();
+  }, POLL_MS);
   cleanups.push(() => clearInterval(poll));
 
   cleanups.push(() => playerResizeObs?.disconnect());
-  // 進行中の attemptYtSync は seq 番号で自然に無効化される(明示 clear 不要)
 
-  // Wire up panel controls.
   for (const inp of Object.values(ui.inputs)) {
     inp.addEventListener('input', onUiInput);
     inp.addEventListener('change', onUiInput);
   }
-  ui.toggleBtn.addEventListener('click', () => {
+  // バークリックでパネル展開。ただしバー内のスイッチ操作は除外。
+  ui.toggleBtn.addEventListener('click', (e) => {
+    if (e.target.closest('.ds-switch')) return;
     ui.panel.classList.toggle('dualsub-open');
   });
+  // キーボードアクセシビリティ: Enter / Space で展開
+  ui.toggleBtn.addEventListener('keydown', (e) => {
+    if (e.target.closest('.ds-switch')) return;
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      ui.panel.classList.toggle('dualsub-open');
+    }
+  });
 
-  // Hide our panel while fullscreen (the native player owns the screen).
   const onFsChange = () => {
     ui.panel.style.display = document.fullscreenElement ? 'none' : (player ? '' : 'none');
   };
@@ -904,6 +1063,9 @@
     delete window.__dualsubStop;
     console.log('[dualsub] stopped');
   };
+
+  // デバッグ用: 内部状態の覗き見
+  window.__dualsubState = () => ({ config: { ...config }, caption: CaptionStore.state });
 
   console.log('[dualsub] ready · stop with __dualsubStop()');
 })();
