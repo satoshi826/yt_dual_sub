@@ -425,8 +425,9 @@
         --ds-warn-border:   rgba(255,183,77,0.65);
         --ds-error-border:  rgba(239,83,80,0.7);
 
-        --ds-bg:            rgba(15,18,24,0.85);
-        --ds-bg-strong:     rgba(15,18,24,0.95);
+        /* backdrop-filter で blur をかけるので alpha は薄め */
+        --ds-bg:            rgba(15,18,24,0.6);
+        --ds-bg-strong:     rgba(15,18,24,0.8);
         --ds-border:        rgba(255,255,255,0.12);
         --ds-text:          #f3f5f8;
         --ds-text-dim:      rgba(243,245,248,0.55);
@@ -494,6 +495,7 @@
         gap: 8px;
         padding: 0 12px;
         background: linear-gradient(135deg, var(--ds-bg) 0%, var(--ds-bg-strong) 100%);
+        backdrop-filter: blur(16px) saturate(180%);
         border: 1px solid var(--ds-border);
         border-radius: 22px;
         box-shadow:
@@ -544,6 +546,7 @@
         box-sizing: border-box;
         overflow-y: auto;
         background: linear-gradient(180deg, var(--ds-bg-strong) 0%, var(--ds-bg) 100%);
+        backdrop-filter: blur(20px) saturate(180%);
         border: 1px solid var(--ds-border);
         border-radius: 16px;
         padding: 12px 14px;
