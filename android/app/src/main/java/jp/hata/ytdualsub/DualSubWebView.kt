@@ -8,6 +8,8 @@ import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.view.ViewGroup
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.viewinterop.AndroidView
@@ -15,11 +17,7 @@ import java.io.BufferedReader
 
 private const val TAG = "DualSubWebView"
 
-// www.youtube.com (デスクトップ版) を直接開く。m.youtube.com (モバイル版) は WebView
-// で開くとプレーヤーが sticky-player 状態(125px ミニプレーヤー固定)に強制される
-// 既知問題があり、UA 偽装などでは回避不能だった。一方 www.youtube.com には
-// sticky-player クラス自体が存在しないので問題が発生しない。
-private const val INITIAL_URL = "https://www.youtube.com/"
+private const val INITIAL_URL = "https://m.youtube.com/"
 
 // 内容ベースの 8 桁 hex ハッシュ。assets/dualsub_overlay.js が 1 文字でも変われば
 // 変わるので、「今動いているコードがどのバージョンか」をリビルド検証用に
@@ -29,12 +27,17 @@ private fun shortHash(s: String): String =
 
 @Composable
 fun DualSubWebView(onWebViewReady: (WebView) -> Unit) {
+    // 重要: AndroidView は必ず Modifier.fillMaxSize() を付ける。これを忘れると
+    // Compose 側の measure pass で WebView の高さ制約が宙ぶらりんになり、
+    // 内部の Chromium CSS engine が viewport height=0 と認識する。結果、
+    // matchMedia('(orientation: landscape)') が portrait なのに true を返し、
+    // m.youtube.com の landscape 用 CSS (~190 ルール) が誤適用され player が
+    // 125px に縮む等の症状が出る。WebView 側の layoutParams も MATCH_PARENT を
+    // 明示している(下記 createConfiguredWebView 内)。
     AndroidView(
-        modifier = Modifier,
+        modifier = Modifier.fillMaxSize(),
         factory = { ctx ->
-            // assets/dualsub_overlay.js を一度だけ読み込む
             val injectionScript = loadInjectionScript(ctx.assets)
-
             createConfiguredWebView(ctx, injectionScript).also(onWebViewReady)
         },
     )
@@ -52,7 +55,15 @@ private fun createConfiguredWebView(
     val overlayHash = shortHash(injectionScript)
     Log.i(TAG, "dualsub build: overlay=$overlayHash")
 
-    val webView = WebView(context)
+    val webView = WebView(context).apply {
+        // layoutParams を MATCH_PARENT で明示。これが無いと WebView の高さが 0 として
+        // 内部 CSS engine に通知され、matchMedia('(orientation: landscape)') が誤って
+        // true を返す。AndroidView 側の Modifier.fillMaxSize と対になる設定。
+        layoutParams = ViewGroup.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT,
+        )
+    }
 
     with(webView.settings) {
         javaScriptEnabled = true
